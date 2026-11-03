@@ -1,0 +1,104 @@
+name: Oracle A1 Always Free - capacity retry
+
+on:
+  # schedule:
+  #   # Every 5 minutes, offset from the busy top-of-hour boundary. UTC.
+  #   - cron: '2/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Validate settings WITHOUT launching a VM'
+        required: true
+        default: true
+        type: boolean
+
+# Never overlap two create attempts for the same tenancy.
+concurrency:
+  group: oracle-a1-launch
+  cancel-in-progress: false
+
+jobs:
+  attempt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 4
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.launch.outputs.result }}
+    steps:
+      - name: Checkout reviewed code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Create an isolated Python environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/oci-venv"
+          "$RUNNER_TEMP/oci-venv/bin/python" -m pip install --disable-pip-version-check 'oci==2.189.0'
+
+      - name: Prepare OCI credentials (never commit them)
+        shell: bash
+        env:
+          OCI_USER_OCID: ${{ secrets.OCI_USER_OCID }}
+          OCI_TENANCY_OCID: ${{ secrets.OCI_TENANCY_OCID }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_API_PRIVATE_KEY: ${{ secrets.OCI_API_PRIVATE_KEY }}
+          OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          for variable in OCI_USER_OCID OCI_TENANCY_OCID OCI_FINGERPRINT OCI_API_PRIVATE_KEY OCI_SSH_PUBLIC_KEY; do
+            if [[ -z "${!variable}" ]]; then
+              echo "::error::Missing required GitHub Actions secret: ${variable}"
+              exit 1
+            fi
+          done
+          umask 077
+          mkdir -p "$HOME/.oci"
+          printf '%s\n' "$OCI_API_PRIVATE_KEY" > "$HOME/.oci/api_key.pem"
+          printf '%s\n' "$OCI_SSH_PUBLIC_KEY" > "$HOME/.oci/vm_ssh.pub"
+          printf '[DEFAULT]\nuser=%s\ntenancy=%s\nfingerprint=%s\nregion=ap-singapore-1\nkey_file=%s/.oci/api_key.pem\n' \
+            "$OCI_USER_OCID" "$OCI_TENANCY_OCID" "$OCI_FINGERPRINT" "$HOME" > "$HOME/.oci/config"
+          chmod 600 "$HOME/.oci/config" "$HOME/.oci/api_key.pem" "$HOME/.oci/vm_ssh.pub"
+
+      - name: Try to launch exactly once
+        id: launch
+        shell: bash
+        env:
+          OCI_COMPARTMENT_OCID: ${{ vars.OCI_COMPARTMENT_OCID }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          args=(--ssh-public-key "$HOME/.oci/vm_ssh.pub")
+          if [[ -n "$OCI_COMPARTMENT_OCID" ]]; then
+            args+=(--compartment-id "$OCI_COMPARTMENT_OCID")
+          fi
+          if [[ "$DRY_RUN" == 'true' ]]; then
+            args+=(--dry-run)
+          fi
+          "$RUNNER_TEMP/oci-venv/bin/python" oracle_a1_once.py "${args[@]}"
+
+      - name: Remove ephemeral credential files
+        if: always()
+        shell: bash
+        run: rm -f "$HOME/.oci/api_key.pem" "$HOME/.oci/vm_ssh.pub" "$HOME/.oci/config"
+
+  disable-schedule:
+    needs: attempt
+    # Success (new or pre-existing instance), OR any non-capacity failure.
+    # Capacity miss and dry runs do not disable the scheduler.
+    if: ${{ always() && (needs.attempt.result == 'failure' || needs.attempt.outputs.result == 'created' || needs.attempt.outputs.result == 'exists') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions:
+      actions: write
+    steps:
+      - name: Disable future retries
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Disabling future runs of oracle-a1.yml (success, existing VM, or error)."
+          gh api --method PUT "repos/$GITHUB_REPOSITORY/actions/workflows/oracle-a1.yml/disable"
