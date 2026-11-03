@@ -3,7 +3,7 @@ name: Oracle A1 Always Free - capacity retry
 on:
   schedule:
     # Every 5 minutes, offset from the busy top-of-hour boundary. UTC.
-    - cron: '2/5 * * * *'
+    - cron: '1/5 * * * *'
   workflow_dispatch:
     inputs:
       dry_run:
