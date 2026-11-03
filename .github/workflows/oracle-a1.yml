@@ -2,7 +2,7 @@ name: Oracle A1 Always Free - capacity retry
 
 on:
   schedule:
-    - cron: '3/5 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
     inputs:
       dry_run:
